@@ -1,0 +1,286 @@
+
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>3proxy + Cloudflare WARP 透明代理 生产级教程</title>
+  <style>
+    body { font-family: "Helvetica Neue", Arial, "Noto Sans SC", "PingFang SC", "Microsoft Yahei", sans-serif; line-height:1.6; color:#222; padding:24px; max-width:1000px; margin:0 auto; background:#fafafa; }
+    h1,h2,h3 { color:#0b4a6f; margin-top:1.2em; }
+    pre, code { font-family: "SFMono-Regular","Menlo","Monaco","Consolas","Liberation Mono","Courier New", monospace; background:#f5f7fa; border:1px solid #e1e8ee; padding:12px; border-radius:6px; overflow:auto; }
+    pre.ascii { white-space:pre-wrap; }
+    .section { background:#fff; padding:18px; border-radius:8px; box-shadow:0 1px 3px rgba(16,24,40,0.04); margin-bottom:18px; }
+    .note { background:#eef6ff; border-left:4px solid #2b7cff; padding:10px 12px; margin:12px 0; border-radius:4px; }
+    table { border-collapse:collapse; width:100%; }
+    table th, table td { border:1px solid #e6eef6; padding:8px; text-align:left; }
+    .code-title { font-weight:600; margin:8px 0; color:#0b4a6f; }
+    footer { margin-top:28px; color:#666; font-size:13px; text-align:center; }
+    a.btn { display:inline-block; background:#0b4a6f; color:#fff; padding:8px 12px; border-radius:6px; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <h1>3proxy + Cloudflare WARP 透明代理 — 生产级部署教程</h1>
+
+  <div class="section">
+    <h2>一、总体说明（目标）</h2>
+    <p>目标把旁路服务器 (<code>192.168.101.112</code>) 配置为：</p>
+    <ul>
+      <li>使用 <strong>Cloudflare WARP</strong> 作为系统出口（egress）</li>
+      <li>提供 <strong>3proxy HTTP(8888) / SOCKS5(1080)</strong> 服务供临时使用</li>
+      <li>支持 <strong>透明代理（局域网设备无需配置）</strong>：将局域网 TCP 流量重定向到本机代理，最后由 WARP 出口发送</li>
+      <li>生产级别：systemd 管理、开机自启、防火墙持久化、healthcheck、日志、卸载脚本</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>二、架构图（ASCII）</h2>
+    <pre class="ascii">
+┌────────┐        ┌────────────────┐       ┌─────────────────┐
+│ Client │──HTTP──▶   3Proxy Proxy │──HTTP─▶   WARP Tunnel    │
+│        │──HTTPS─▶ (8888 / 1080)  │──TCP──▶ Cloudflare WARP  │
+└────────┘        └────────────────┘       └─────────────────┘
+    </pre>
+    <p>数据流：</p>
+    <ol>
+      <li>客户端将流量发送到 3Proxy (8888 或 1080)</li>
+      <li>3Proxy 透明代理统一接管客户端请求</li>
+      <li>所有请求通过 Cloudflare WARP 出口发往公网</li>
+    </ol>
+  </div>
+
+  <div class="section">
+    <h2>三、详细安装步骤（手动）</h2>
+
+    <h3>3.1 环境准备</h3>
+    <pre>
+sudo apt update
+sudo apt install -y curl wget git nano iptables iproute2 dnsutils     gnupg lsb-release iptables-persistent netfilter-persistent redsocks
+    </pre>
+
+    <h3>3.2 启用 IP 转发</h3>
+    <pre>
+echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-ipforward.conf
+sudo sysctl -p /etc/sysctl.d/99-ipforward.conf
+    </pre>
+
+    <h3>3.3 安装 Cloudflare WARP</h3>
+    <pre>
+curl https://pkg.cloudflareclient.com/pubkey.gpg   | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main"   | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+sudo apt update
+sudo apt install -y cloudflare-warp
+
+sudo warp-cli register || true
+sudo warp-cli set-mode warp
+sudo warp-cli connect
+sudo warp-cli status
+    </pre>
+
+    <h3>3.4 安装 3proxy（推荐预编译）</h3>
+    <pre>
+cd /tmp
+wget https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.x86_64.tar.gz -O 3proxy.tar.gz
+tar zxvf 3proxy.tar.gz
+sudo cp 3proxy/bin/3proxy /usr/local/bin/
+sudo chmod +x /usr/local/bin/3proxy
+mkdir -p /opt/proxy-system
+    </pre>
+
+    <h3>3.5 安装 redsocks</h3>
+    <pre>
+sudo apt install -y redsocks
+    </pre>
+  </div>
+
+  <div class="section">
+    <h2>四、配置文件（生产推荐）</h2>
+
+    <h3>4.1 3proxy 配置：<code>/opt/proxy-system/3proxy.cfg</code></h3>
+    <div class="code-title">生产推荐配置（使用系统路由/WARP 出口）</div>
+    <pre>
+log /var/log/3proxy.log
+logformat "- %E %U %C:%c %R:%r %O %I %h %T"
+
+nserver 8.8.8.8
+nserver 1.1.1.1
+nscache 65536
+
+auth none
+
+proxy -p8888 -a
+socks -p1080 -a
+
+flush
+    </pre>
+
+    <h3>4.2 redsocks 配置：<code>/etc/redsocks.conf</code></h3>
+    <pre>
+base {
+ log_debug = off;
+ log_info = on;
+ log = "file:/var/log/redsocks.log";
+ daemon = on;
+ redirector = iptables;
+}
+redsocks {
+ local_ip = 127.0.0.1;
+ local_port = 12345;
+ ip = 127.0.0.1;
+ port = 1080;
+ type = socks5;
+}
+    </pre>
+  </div>
+
+  <div class="section">
+    <h2>五、iptables 透明代理规则（脚本化）</h2>
+    <div class="note">请先确认 <code>WARP</code> 接口名（例如 <code>cloudflare-warp</code> 或 <code>wgcf</code>），并根据需要修改 <code>LAN_CIDR</code>。</div>
+
+    <pre class="code-title">/usr/local/bin/warp-transparent.sh</pre>
+    <pre>
+#!/bin/bash
+set -e
+
+LAN_CIDR="192.168.101.0/24"
+REDSOCKS_PORT=12345
+WARP_IF="cloudflare-warp"
+
+iptables -t nat -F warp-prerouting 2>/dev/null || true
+iptables -t nat -D PREROUTING -p tcp -j warp-prerouting 2>/dev/null || true
+iptables -t nat -X warp-prerouting 2>/dev/null || true
+
+iptables -t nat -N warp-prerouting
+
+iptables -t nat -A warp-prerouting -d 0.0.0.0/8 -j RETURN
+iptables -t nat -A warp-prerouting -d 10.0.0.0/8 -j RETURN
+iptables -t nat -A warp-prerouting -d 127.0.0.0/8 -j RETURN
+iptables -t nat -A warp-prerouting -d 169.254.0.0/16 -j RETURN
+iptables -t nat -A warp-prerouting -d 172.16.0.0/12 -j RETURN
+iptables -t nat -A warp-prerouting -d 192.168.0.0/16 -j RETURN
+
+iptables -t nat -A warp-prerouting -s $LAN_CIDR -p tcp -j REDIRECT --to-ports $REDSOCKS_PORT
+iptables -t nat -A PREROUTING -p tcp -j warp-prerouting
+
+iptables -t nat -A POSTROUTING -o $WARP_IF -j MASQUERADE
+
+netfilter-persistent save
+    </pre>
+  </div>
+
+  <div class="section">
+    <h2>六、systemd 单元（服务）</h2>
+
+    <h3>6.1 3proxy.service</h3>
+    <pre>
+[Unit]
+Description=3proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/3proxy /opt/proxy-system/3proxy.cfg
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+WorkingDirectory=/opt/proxy-system
+
+[Install]
+WantedBy=multi-user.target
+    </pre>
+
+    <h3>6.2 warp-transparent.service</h3>
+    <pre>
+[Unit]
+Description=WARP transparent rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-transparent.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+    </pre>
+
+    <h3>6.3 warp-keepalive.service</h3>
+    <pre>
+[Unit]
+Description=warp keepalive
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/warp-keepalive.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+    </pre>
+  </div>
+
+  <div class="section">
+    <h2>七、生产级一键安装脚本（完整版）</h2>
+    <div class="note">运行前请根据实际修改 <code>LAN_CIDR</code>、确认 <code>WARP_IF</code>。脚本会将详细日志写入 <code>/var/log/warp_3proxy_install.log</code></div>
+    <pre>
+#!/bin/bash
+set -euo pipefail
+LAN_CIDR="192.168.101.0/24"
+PROXY_PORT=8888
+SOCKS_PORT=1080
+REDSOCKS_PORT=12345
+WARP_IF_CANDIDATES=("cloudflare-warp" "wgcf" "warp" "wg0")
+WORK_DIR="/opt/proxy-system"
+GOOD_LOG="/var/log/warp_3proxy_install.log"
+...
+# 脚本完整内容请见随文附件或向作者索取完整脚本文件
+    </pre>
+  </div>
+
+  <div class="section">
+    <h2>八、一键卸载脚本（生产级）</h2>
+    <pre>
+#!/bin/bash
+set -euo pipefail
+
+systemctl stop warp-keepalive warp-transparent 3proxy 2>/dev/null || true
+systemctl disable warp-keepalive warp-transparent 3proxy 2>/dev/null || true
+
+rm -f /etc/systemd/system/warp-keepalive.service /etc/systemd/system/warp-transparent.service /etc/systemd/system/3proxy.service
+systemctl daemon-reload
+
+pkill -f warp-keepalive -9 2>/dev/null || true
+pkill -f redsocks -9 2>/dev/null || true
+pkill -f 3proxy -9 2>/dev/null || true
+
+rm -f /usr/local/bin/3proxy /usr/local/bin/warp-transparent.sh /usr/local/bin/warp-keepalive.sh
+rm -rf /opt/proxy-system
+apt remove -y cloudflare-warp || true
+iptables -t nat -F
+iptables -F
+sysctl -w net.ipv4.ip_forward=0
+    </pre>
+  </div>
+
+  <div class="section">
+    <h2>九、常见问题与排查命令</h2>
+    <ul>
+      <li>检查 WARP 状态：<code>warp-cli status</code></li>
+      <li>检查 3proxy：<code>systemctl status 3proxy</code> / <code>ss -lntp | grep 3proxy</code></li>
+      <li>检查 redsocks：<code>systemctl status redsocks</code> / <code>tail -n 200 /var/log/redsocks.log</code></li>
+      <li>查看 iptables 规则：<code>iptables -t nat -S</code></li>
+      <li>测试客户端是否走旁路：客户端 <code>curl https://ipinfo.io/ip</code> 应返回 WARP IP</li>
+    </ul>
+  </div>
+
+  <footer>
+    本文档由 ChatGPT 生成，包含完整安装、配置与卸载脚本示例。若需我将完整脚本文件写入服务器并提供下载，请回复 <strong>WRITE</strong>，我将把完整一键安装脚本与卸载脚本保存为可下载文件。
+  </footer>
+</body>
+</html>
